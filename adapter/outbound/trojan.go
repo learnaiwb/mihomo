@@ -2,24 +2,23 @@ package outbound
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
-	"net/http"
 	"strconv"
 
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/ca"
-	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/ech"
-	"github.com/metacubex/mihomo/component/proxydialer"
 	tlsC "github.com/metacubex/mihomo/component/tls"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/gun"
 	"github.com/metacubex/mihomo/transport/shadowsocks/core"
 	"github.com/metacubex/mihomo/transport/trojan"
 	"github.com/metacubex/mihomo/transport/vmess"
+
+	"github.com/metacubex/http"
+	"github.com/metacubex/tls"
 )
 
 type Trojan struct {
@@ -48,6 +47,8 @@ type TrojanOption struct {
 	SNI               string         `proxy:"sni,omitempty"`
 	SkipCertVerify    bool           `proxy:"skip-cert-verify,omitempty"`
 	Fingerprint       string         `proxy:"fingerprint,omitempty"`
+	Certificate       string         `proxy:"certificate,omitempty"`
+	PrivateKey        string         `proxy:"private-key,omitempty"`
 	UDP               bool           `proxy:"udp,omitempty"`
 	Network           string         `proxy:"network,omitempty"`
 	ECHOpts           ECHOptions     `proxy:"ech-opts,omitempty"`
@@ -95,19 +96,22 @@ func (t *Trojan) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.
 		}
 
 		alpn := trojan.DefaultWebsocketALPN
-		if len(t.option.ALPN) != 0 {
+		if t.option.ALPN != nil { // structure's Decode will ensure value not nil when input has value even it was set an empty array
 			alpn = t.option.ALPN
 		}
 
 		wsOpts.TLS = true
-		tlsConfig := &tls.Config{
-			NextProtos:         alpn,
-			MinVersion:         tls.VersionTLS12,
-			InsecureSkipVerify: t.option.SkipCertVerify,
-			ServerName:         t.option.SNI,
-		}
-
-		wsOpts.TLSConfig, err = ca.GetSpecifiedFingerprintTLSConfig(tlsConfig, t.option.Fingerprint)
+		wsOpts.TLSConfig, err = ca.GetTLSConfig(ca.Option{
+			TLSConfig: &tls.Config{
+				NextProtos:         alpn,
+				MinVersion:         tls.VersionTLS12,
+				InsecureSkipVerify: t.option.SkipCertVerify,
+				ServerName:         t.option.SNI,
+			},
+			Fingerprint: t.option.Fingerprint,
+			Certificate: t.option.Certificate,
+			PrivateKey:  t.option.PrivateKey,
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -119,13 +123,15 @@ func (t *Trojan) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.
 		// default tcp network
 		// handle TLS
 		alpn := trojan.DefaultALPN
-		if len(t.option.ALPN) != 0 {
+		if t.option.ALPN != nil { // structure's Decode will ensure value not nil when input has value even it was set an empty array
 			alpn = t.option.ALPN
 		}
 		c, err = vmess.StreamTLSConn(ctx, c, &vmess.TLSConfig{
 			Host:              t.option.SNI,
 			SkipCertVerify:    t.option.SkipCertVerify,
 			FingerPrint:       t.option.Fingerprint,
+			Certificate:       t.option.Certificate,
+			PrivateKey:        t.option.PrivateKey,
 			ClientFingerprint: t.option.ClientFingerprint,
 			NextProtos:        alpn,
 			ECH:               t.echConfig,
@@ -189,18 +195,7 @@ func (t *Trojan) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Con
 
 		return NewConn(c, t), nil
 	}
-	return t.DialContextWithDialer(ctx, dialer.NewDialer(t.DialOptions()...), metadata)
-}
-
-// DialContextWithDialer implements C.ProxyAdapter
-func (t *Trojan) DialContextWithDialer(ctx context.Context, dialer C.Dialer, metadata *C.Metadata) (_ C.Conn, err error) {
-	if len(t.option.DialerProxy) > 0 {
-		dialer, err = proxydialer.NewByName(t.option.DialerProxy, dialer)
-		if err != nil {
-			return nil, err
-		}
-	}
-	c, err := dialer.DialContext(ctx, "tcp", t.addr)
+	c, err = t.dialer.DialContext(ctx, "tcp", t.addr)
 	if err != nil {
 		return nil, fmt.Errorf("%s connect error: %w", t.addr, err)
 	}
@@ -243,21 +238,10 @@ func (t *Trojan) ListenPacketContext(ctx context.Context, metadata *C.Metadata) 
 		pc := trojan.NewPacketConn(c)
 		return newPacketConn(pc, t), err
 	}
-	return t.ListenPacketWithDialer(ctx, dialer.NewDialer(t.DialOptions()...), metadata)
-}
-
-// ListenPacketWithDialer implements C.ProxyAdapter
-func (t *Trojan) ListenPacketWithDialer(ctx context.Context, dialer C.Dialer, metadata *C.Metadata) (_ C.PacketConn, err error) {
-	if len(t.option.DialerProxy) > 0 {
-		dialer, err = proxydialer.NewByName(t.option.DialerProxy, dialer)
-		if err != nil {
-			return nil, err
-		}
-	}
 	if err = t.ResolveUDP(ctx, metadata); err != nil {
 		return nil, err
 	}
-	c, err := dialer.DialContext(ctx, "tcp", t.addr)
+	c, err = t.dialer.DialContext(ctx, "tcp", t.addr)
 	if err != nil {
 		return nil, fmt.Errorf("%s connect error: %w", t.addr, err)
 	}
@@ -271,11 +255,6 @@ func (t *Trojan) ListenPacketWithDialer(ctx context.Context, dialer C.Dialer, me
 
 	pc := trojan.NewPacketConn(c)
 	return newPacketConn(pc, t), err
-}
-
-// SupportWithDialer implements C.ProxyAdapter
-func (t *Trojan) SupportWithDialer() C.NetWork {
-	return C.ALLNet
 }
 
 // SupportUOT implements C.ProxyAdapter
@@ -310,16 +289,18 @@ func NewTrojan(option TrojanOption) (*Trojan, error) {
 			name:   option.Name,
 			addr:   addr,
 			tp:     C.Trojan,
+			pdName: option.ProviderName,
 			udp:    option.UDP,
 			tfo:    option.TFO,
 			mpTcp:  option.MPTCP,
 			iface:  option.Interface,
 			rmark:  option.RoutingMark,
-			prefer: C.NewDNSPrefer(option.IPVersion),
+			prefer: option.IPVersion,
 		},
 		option:      &option,
 		hexPassword: trojan.Key(option.Password),
 	}
+	t.dialer = option.NewDialer(t.DialOptions())
 
 	var err error
 	t.realityConfig, err = option.RealityOpts.Parse()
@@ -348,30 +329,24 @@ func NewTrojan(option TrojanOption) (*Trojan, error) {
 
 	if option.Network == "grpc" {
 		dialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
-			var err error
-			var cDialer C.Dialer = dialer.NewDialer(t.DialOptions()...)
-			if len(t.option.DialerProxy) > 0 {
-				cDialer, err = proxydialer.NewByName(t.option.DialerProxy, cDialer)
-				if err != nil {
-					return nil, err
-				}
-			}
-			c, err := cDialer.DialContext(ctx, "tcp", t.addr)
+			c, err := t.dialer.DialContext(ctx, "tcp", t.addr)
 			if err != nil {
 				return nil, fmt.Errorf("%s connect error: %s", t.addr, err.Error())
 			}
 			return c, nil
 		}
 
-		tlsConfig := &tls.Config{
-			NextProtos:         option.ALPN,
-			MinVersion:         tls.VersionTLS12,
-			InsecureSkipVerify: option.SkipCertVerify,
-			ServerName:         option.SNI,
-		}
-
-		var err error
-		tlsConfig, err = ca.GetSpecifiedFingerprintTLSConfig(tlsConfig, option.Fingerprint)
+		tlsConfig, err := ca.GetTLSConfig(ca.Option{
+			TLSConfig: &tls.Config{
+				NextProtos:         option.ALPN,
+				MinVersion:         tls.VersionTLS12,
+				InsecureSkipVerify: option.SkipCertVerify,
+				ServerName:         option.SNI,
+			},
+			Fingerprint: option.Fingerprint,
+			Certificate: option.Certificate,
+			PrivateKey:  option.PrivateKey,
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -381,6 +356,7 @@ func NewTrojan(option TrojanOption) (*Trojan, error) {
 		t.gunTLSConfig = tlsConfig
 		t.gunConfig = &gun.Config{
 			ServiceName:       option.GrpcOpts.GrpcServiceName,
+			UserAgent:         option.GrpcOpts.GrpcUserAgent,
 			Host:              option.SNI,
 			ClientFingerprint: option.ClientFingerprint,
 		}
